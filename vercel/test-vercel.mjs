@@ -68,6 +68,15 @@ await check("health banner", async () => {
   assert.equal((await r.text()).trim(), "bansos relay ok");
 });
 
+// Uptime checks and load balancers commonly probe with HEAD. The handler only
+// answered GET, so HEAD / fell through to "missing x-relay-target" -> 400, which
+// reads as "dead" to any monitor that does not follow with a GET.
+await check("health banner on HEAD", async () => {
+  const r = await req("/", { method: "HEAD" });
+  assert.equal(r.status, 200);
+  assert.equal(await r.text(), "");
+});
+
 await check("forbidden target", async () => {
   assert.equal((await post("{}", { "x-relay-target": "https://evil.example.com" })).status, 403);
 });

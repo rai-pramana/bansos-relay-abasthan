@@ -57,23 +57,26 @@ const server = http.createServer(async (req, res) => {
   const target = req.headers["x-relay-target"];
   const path = req.headers["x-relay-path"] || "/";
 
-  // Health banner: only when no relay headers are present.
-  if (req.method === "GET" && !target) {
+  // Health banner: only when no relay headers are present. GET or HEAD — uptime
+  // checks and load balancers commonly probe with HEAD, and answering 400 there
+  // reads as "dead" to every monitor that does not follow with a GET.
+  if ((req.method === "GET" || req.method === "HEAD") && !target) {
     const url = new URL(req.url || "/", "http://localhost");
     if (url.searchParams.get("diag") === "egress") {
       try {
         const echo = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
           signal: AbortSignal.timeout(10000),
         });
+        const trace = await echo.text();
         res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
-        return res.end(await echo.text());
+        return res.end(req.method === "HEAD" ? undefined : trace);
       } catch {
         res.writeHead(502, { "content-type": "text/plain" });
         return res.end("egress diag failed\n");
       }
     }
     res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
-    return res.end("bansos relay ok\n");
+    return res.end(req.method === "HEAD" ? undefined : "bansos relay ok\n");
   }
 
   if (!target) { res.writeHead(400); return res.end("missing x-relay-target\n"); }

@@ -53,6 +53,15 @@ test("health banner only when no relay headers are present", async () => {
   assert.match(r.headers.get("cache-control"), /no-store/);
 });
 
+// Uptime checks and load balancers commonly probe with HEAD. The banner only
+// answered GET, so HEAD / fell through to "missing x-relay-target" -> 400, which
+// reads as "dead" to any monitor that does not follow up with a GET.
+test("health banner answers HEAD with no body", async () => {
+  const r = await send("/", { method: "HEAD" });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body, "");
+});
+
 test("missing x-relay-target is a 400, not a health check", async () => {
   const r = await send("/", { method: "POST", body: "{}" });
   assert.strictEqual(r.status, 400);

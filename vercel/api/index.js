@@ -73,8 +73,9 @@ module.exports = async function handler(req, res) {
   const target = req.headers["x-relay-target"];
   const path = req.headers["x-relay-path"] || "/";
 
-  // Health banner: only when no relay headers present.
-  if (req.method === "GET" && !target) {
+  // Health banner: only when no relay headers are present. GET or HEAD — uptime
+  // checks commonly probe with HEAD, and a 400 there reads as "dead".
+  if ((req.method === "GET" || req.method === "HEAD") && !target) {
     // Diagnostic: ?diag=egress reports this function's outbound (egress) IP
     // as seen by an external IP-echo service. Snapshot only — Vercel NAT
     // pools rotate, so re-query when comparing across time.
