@@ -219,3 +219,22 @@ health check is worth more than a fleet you have to babysit.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Running the tests
+
+`vercel/test-vercel.mjs` boots the handler in a plain `node:http` wrapper and
+asserts the contract plus every bound, offline:
+
+```sh
+node vercel/test-vercel.mjs
+```
+
+The handler is loaded with `createRequire`, not `import`: it is CommonJS on
+purpose so Vercel honours `bodyParser: false`, and an ESM default import fails
+with "does not provide an export named 'default'". `vercel/api/package.json`
+scopes `"type": "commonjs"` to that directory so the same file also loads under
+a root project with `"type": "module"`.
+
+One case (a well-formed small gzip) needs a live upstream and reports `SKIP`
+when there is no peer. Skips are counted separately from failures, so a skipped
+case is never mistaken for a passing one.
