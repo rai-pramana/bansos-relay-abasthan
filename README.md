@@ -164,13 +164,34 @@ Two failures that look like relay bugs but are not:
 
 | Host | Egress IP observed | Notes |
 |---|---|---|
-| Vercel (sin1) | `44.200.172.182` · colo `IAD` | Region pins the function, not the egress. Free tier, always on. |
-| Abasthan (Free) | `103.42.158.158` · colo `BOM` | India. 6 min idle did **not** sleep it. Cold start ~48 s; warm TTFB 1.2–2.4 s vs 0.6–1.5 s on Vercel. |
+| Vercel (sin1) | `44.200.172.182` · colo `IAD` | Region pins the function, not the egress. Free tier, always on. Payload ceiling ~4.5 MB (`FUNCTION_PAYLOAD_TOO_LARGE`). |
+| Abasthan (Free) | `103.42.158.158` · colo `BOM` | India, stable IP. 15 min idle did **not** sleep it. Cold start ~48 s; warm TTFB 1.2–2.4 s vs 0.6–1.5 s on Vercel. **POST ceiling ~1 MiB at the edge**, and the shared IP is rate-limited by upstreams faster than either alternative. |
 
 The lesson in that table: **you do not choose the egress IP, the host's network
 does.** On providers that pin egress per region, deploying in `sin1` still
 produced a US address. Always measure `?diag=egress`; never infer it from the
 region you selected.
+
+## Two failure modes worth designing for
+
+Both were found by trying to break a working deployment rather than by reading it.
+
+**The body cap does not cap what a body expands to.** An 8 MiB limit on the
+upload looks sufficient until gzip enters the picture: repetitive JSON compresses
+~1000:1, so a 915 KB upload inflated to 200 MB and drove the process to 900 MB
+RSS — an OOM-kill on a 512 MB box, with every in-flight stream dying with it. A
+size limit on the *compressed* bytes is not a memory limit. Pass
+`maxOutputLength` to `zlib.gunzipSync` so the inflate aborts instead of
+allocating; after that change the same bomb costs 116 ms and leaves RSS at
+100 MB.
+
+**A whole-request abort timer kills healthy streams.** Wrapping `fetch` in
+`AbortSignal.timeout(120_000)` looks like a sensible upstream deadline, but the
+signal stays armed while the response body streams — so a legitimate
+three-minute token stream dies at two minutes. Clear the timer once headers
+arrive and give the *body* an idle guard that measures the gap between chunks.
+Different question ("has this stalled?") needs a different timer than "has this
+taken too long?"
 
 ---
 
