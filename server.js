@@ -18,12 +18,16 @@ const FORBIDDEN_REQUEST_HEADERS = new Set([
 ]);
 const SAFE_PATH = /^\/(?!\/)/;
 
-// A Free-tier instance is 512 MB / 0.1 vCPU. Without these two limits a single
+// A Free-tier instance is 512 MB / 0.1 vCPU. Without these limits a single
 // caller can hang the process: an unbounded body fills RAM, and an upstream that
 // never answers holds a socket until the platform kills the container (which
 // restarts the whole relay, not just that request).
 const MAX_BODY_BYTES = 8 * 1024 * 1024;   // 8 MiB — a 1M-token prompt is ~4 MiB
 const UPSTREAM_TIMEOUT_MS = 120_000;      // streaming budget, not idle-connect
+// The compressed body limit is useless on its own: gzip reaches ~1000:1 on
+// repetitive JSON, so a 900 KB upload expanded to 200 MB and pushed RSS to
+// 900 MB in testing — an OOM-kill on a 512 MB box. Cap the expansion too.
+const MAX_INFLATED_BYTES = 32 * 1024 * 1024;
 
 function readBody(req, res) {
   return new Promise((resolve) => {
@@ -87,8 +91,16 @@ const server = http.createServer(async (req, res) => {
     const raw = await readBody(req, res);
     if (raw === null) return;                    // 413 sent, or socket died
     if (String(req.headers["content-encoding"] || "").includes("gzip")) {
-      try { body = zlib.gunzipSync(raw).toString("utf8"); }
-      catch { res.writeHead(400); return res.end("relay gunzip failed\n"); }
+      // maxOutputLength aborts the inflate instead of allocating first, so a
+      // decompression bomb costs one error rather than all the RAM.
+      try {
+        body = zlib.gunzipSync(raw, { maxOutputLength: MAX_INFLATED_BYTES }).toString("utf8");
+      } catch (err) {
+        const tooBig = err && (err.code === "ERR_BUFFER_TOO_LARGE" ||
+                               String(err.message).includes("maxOutputLength"));
+        res.writeHead(tooBig ? 413 : 400);
+        return res.end(tooBig ? "relay inflated body too large\n" : "relay gunzip failed\n");
+      }
     } else {
       body = raw.toString("utf8");
     }
