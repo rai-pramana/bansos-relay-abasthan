@@ -39,15 +39,34 @@ const FORBIDDEN_REQUEST_HEADERS = new Set([
 // credentialed URLs, but that is luck, not policy — assert it.
 const SAFE_PATH = /^\/(?!\/)/;
 
+// Bounds that the platform does not provide. Vercel rejects very large bodies at
+// its own edge (measured ~4.5 MB for FUNCTION_PAYLOAD_TOO_LARGE), but that is the
+// compressed request — a 4 MB gzip of repetitive JSON inflated fine and reached
+// the upstream. Two distinct costs, two distinct limits:
+const MAX_BODY_BYTES = 8 * 1024 * 1024;      // compressed upload
+const MAX_INFLATED_BYTES = 32 * 1024 * 1024; // what gunzip is allowed to produce
+const UPSTREAM_TIMEOUT_MS = 120_000;         // headers + stream idle guard
+
 // Read the raw request body from the stream ALONE. Never touch req.body: reading
 // that property makes the platform parse the body even with bodyParser:false, and
 // a gzip body then fails to parse and the request dies 400 before this handler can
 // answer (measured — a probe that only mentions req.body reproduces it, one that
 // iterates the stream does not).
+//
+// Returns { raw } or { error: "too-large" } or { error: "read-failed" }.
 async function readRaw(req) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
-  return Buffer.concat(chunks);
+  let size = 0;
+  try {
+    for await (const c of req) {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) return { error: "too-large" };
+      chunks.push(c);
+    }
+  } catch {
+    return { error: "read-failed" };
+  }
+  return { raw: Buffer.concat(chunks) };
 }
 
 module.exports = async function handler(req, res) {
@@ -93,39 +112,62 @@ module.exports = async function handler(req, res) {
   }
 
   let upstream;
-  try {
-    const init = { method: req.method, headers };
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      let raw;
+  const init = { method: req.method, headers };
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const got = await readRaw(req);
+    if (got.error === "too-large") return res.status(413).send("relay body too large\n");
+    if (got.error === "read-failed") return res.status(400).send("relay body read failed\n");
+    const raw = got.raw;
+
+    const enc = String(req.headers["content-encoding"] || "").toLowerCase();
+    const isBinary = Buffer.isBuffer(raw) || raw instanceof Uint8Array;
+    if (enc.includes("gzip")) {
+      // maxOutputLength aborts the inflate instead of allocating first, so a
+      // decompression bomb costs one error rather than all the RAM. Without it a
+      // 915 KB gzip of repetitive JSON expanded to 200 MB and pushed RSS to
+      // 900 MB in testing on the smaller Free-tier host.
       try {
-        raw = await readRaw(req);
-      } catch {
-        return res.status(400).send("relay body read failed\n");
+        const inflated = zlib.gunzipSync(
+          isBinary ? Buffer.from(raw) : Buffer.from(String(raw), "latin1"),
+          { maxOutputLength: MAX_INFLATED_BYTES },
+        );
+        init.body = inflated.toString("utf8");
+      } catch (err) {
+        const tooBig = err && (err.code === "ERR_BUFFER_TOO_LARGE" ||
+                               String(err.message).includes("maxOutputLength"));
+        return tooBig
+          ? res.status(413).send("relay inflated body too large\n")
+          : res.status(400).send("relay gunzip failed\n");
       }
-      const enc = String(req.headers["content-encoding"] || "").toLowerCase();
-      const isBinary = Buffer.isBuffer(raw) || raw instanceof Uint8Array;
-      if (enc.includes("gzip")) {
-        let gunzipped;
-        try {
-          gunzipped = zlib
-            .gunzipSync(isBinary ? Buffer.from(raw) : Buffer.from(String(raw), "latin1"))
-            .toString("utf8");
-        } catch {
-          return res.status(400).send("relay gunzip failed\n");
-        }
-        init.body = gunzipped;
-      } else if (typeof raw === "string") {
-        init.body = raw;
-      } else if (isBinary) {
-        init.body = Buffer.from(raw).toString("utf8");
-      } else {
-        init.body = JSON.stringify(raw);
-      }
+    } else if (typeof raw === "string") {
+      init.body = raw;
+    } else if (isBinary) {
+      init.body = Buffer.from(raw).toString("utf8");
+    } else {
+      init.body = JSON.stringify(raw);
     }
+  }
+
+  // The abort timer is cleared as soon as response headers arrive. Keeping it
+  // armed through the body would kill a healthy multi-minute stream at the
+  // deadline, because the signal covers body reading too — a different question
+  // ("has this stalled?") needs a different timer than "has this taken too long?".
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT_MS);
+  init.signal = ac.signal;
+
+  try {
     upstream = await fetch(target + path, init);
   } catch (err) {
-    return res.status(502).send("relay upstream error\n");
+    clearTimeout(timer);
+    // A timeout is not an upstream error in the client's terms: 504 says
+    // "the relay gave up", 502 says "the relay could not reach it".
+    const timedOut = err && (err.name === "AbortError" || err.name === "TimeoutError");
+    return res.status(timedOut ? 504 : 502).send(
+      timedOut ? "relay upstream timeout\n" : "relay upstream error\n",
+    );
   }
+  clearTimeout(timer);
 
   res.status(upstream.status);
   for (const [k, v] of upstream.headers) {
@@ -138,18 +180,34 @@ module.exports = async function handler(req, res) {
   res.setHeader("cache-control", "no-store");
 
   try {
-    if (upstream.body) {
-      // Stream chunk-by-chunk with explicit flushHeaders. Earlier note said
-      // res.send() 405s on POST and pipe() hangs without flushing — the fix
-      // is to write the head ourselves and hand each chunk to res.write().
-      res.flushHeaders();
-      for await (const c of upstream.body) {
-        res.write(c);
+    if (!upstream.body) return res.end();
+
+    // Stream chunk-by-chunk with explicit flushHeaders. Earlier note said
+    // res.send() 405s on POST and pipe() hangs without flushing — the fix
+    // is to write the head ourselves and hand each chunk to res.write().
+    res.flushHeaders();
+    const reader = upstream.body.getReader();
+
+    // Idle guard on the body only: upstreams legitimately pause between tokens,
+    // so measure the gap between chunks, not the total duration. Reset per chunk.
+    let idle = null;
+    const armIdle = () => setTimeout(() => reader.cancel().catch(() => {}), UPSTREAM_TIMEOUT_MS);
+    try {
+      for (;;) {
+        idle = armIdle();
+        const { done, value } = await reader.read();
+        clearTimeout(idle);
+        idle = null;
+        if (done) break;
+        res.write(value);
       }
-      return res.end();
+    } finally {
+      if (idle) clearTimeout(idle);
     }
     return res.end();
   } catch (err) {
+    // Client hung up, or the idle guard fired: end what we have rather than
+    // leaving the response open.
     try { res.end(); } catch {}
     return;
   }

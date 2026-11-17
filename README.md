@@ -110,14 +110,26 @@ allowlist intact.
 ### Vercel
 
 See [`vercel/`](vercel/): a separate `api/index.js` in CommonJS form plus the
-`vercel.json` that pins `maxDuration`. Two things that are not obvious:
+`vercel.json` that pins `maxDuration`. Four things that are not obvious:
 
 - the handler **must** live at `api/index.js` — a `functions` entry pointing at
   any other path fails the build with `unused_function`;
 - once `rewrites` send `/` to `/api`, a project-scoped **Deployment Protection**
   (SSO) will intercept the root URL even after you disable it on the API path.
   Disable it on the project, then confirm `GET /` returns `bansos relay ok`
-  *without* credentials before you trust the URL.
+  *without* credentials before you trust the URL;
+- a fresh Vercel project also hands hashed `*-<user>.vercel.app` URLs to SSO by
+  default. Test on a custom alias, not on the raw deployment URL, or a working
+  relay looks broken;
+- `vercel/package.json` deliberately has **no** `"type": "module"`. The handler is
+  CommonJS, so a parent project with `"type": "module"` would load `api/index.js`
+  as ESM and die at `require is not defined` while the build stayed green.
+
+The Vercel handler carries the same bounds as `server.js` (8 MiB compressed body,
+32 MiB inflated, 120 s header + idle timeout) even though Vercel's own edge
+already rejects large payloads: a 4 MB gzip of repetitive JSON inflated fine and
+reached the upstream, so "the platform limits it" is not the same claim as
+"this handler is safe".
 
 ### Abasthan (or any "web service" PaaS)
 
